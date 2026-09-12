@@ -3,57 +3,98 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <time.h>
-
+#include <SPI.h>
+#include <ELECHOUSE_CC1101_SRC_DRV.h>
 #include "secrets.h"
 
-// -----------------------------------------------------------------------------
-// Configuration
-// -----------------------------------------------------------------------------
+#define CC1101_GDO0  36
+#define CC1101_CS    17
+#define CC1101_SCK   22
+#define CC1101_MOSI  23
+#define CC1101_MISO  32
 
+static constexpr float CC1101_FREQ_MHZ = 433.945;
+static constexpr uint32_t SHORT_MIN_US = 200;
+static constexpr uint32_t SHORT_MAX_US = 450;
+static constexpr uint32_t LONG_MIN_US = 700;
+static constexpr uint32_t LONG_MAX_US = 1050;
+static constexpr uint32_t FRAME_GAP_US = 3000;
+static constexpr size_t EDGE_BUFFER_SIZE = 512;
 static constexpr char HOSTNAME[] = "local433signals";
-
-// Central Time with automatic DST
-static constexpr char TZ_INFO[] =
-    "CST6CDT,M3.2.0/2,M11.1.0/2";
-
+static constexpr char TZ_INFO[] = "CST6CDT,M3.2.0/2,M11.1.0/2";
 static constexpr char NTP_SERVER_1[] = "pool.ntp.org";
 static constexpr char NTP_SERVER_2[] = "time.nist.gov";
+static constexpr size_t MAX_MESSAGES = 50;
 
-static constexpr uint32_t STATUS_PRINT_INTERVAL_MS = 10000;
+uint64_t lastPrintedRfCode = 0;
+uint32_t lastPrintedRfMs = 0;
 
-// -----------------------------------------------------------------------------
-// Web server
-// -----------------------------------------------------------------------------
+static constexpr uint32_t RF_DUPLICATE_WINDOW_MS = 1000;
 
-WebServer server(80);
-
-// -----------------------------------------------------------------------------
-// RF signal storage
-//
-// For now this is transport/storage infrastructure.
-// The CC1101 receiver will feed this structure next.
-// -----------------------------------------------------------------------------
-
-struct RfSignal
+struct RawEdge
 {
-    uint32_t sequence;
-    uint64_t timestampMs;
+    uint32_t durationUs;
+    bool level;
+};
+
+volatile RawEdge edgeBuffer[EDGE_BUFFER_SIZE];
+volatile size_t edgeWriteIndex = 0;
+volatile size_t edgeReadIndex = 0;
+volatile uint32_t lastEdgeMicros = 0;
+volatile uint32_t droppedEdges = 0;
+
+struct FramePulse
+{
     bool level;
     uint32_t durationUs;
 };
 
-static constexpr size_t MAX_SIGNALS = 100;
+static constexpr size_t MAX_FRAME_PULSES = 128;
 
-RfSignal signals[MAX_SIGNALS];
+FramePulse framePulses[MAX_FRAME_PULSES];
 
-size_t signalWriteIndex = 0;
-size_t signalCount = 0;
+size_t framePulseCount = 0;
 
-uint32_t signalSequence = 0;
+int frameRssiPeak = -999;
 
-// -----------------------------------------------------------------------------
-// Time helpers
-// -----------------------------------------------------------------------------
+bool isShortPulse(uint32_t durationUs)
+{
+    return
+        durationUs >= SHORT_MIN_US &&
+        durationUs <= SHORT_MAX_US;
+}
+
+bool isLongPulse(uint32_t durationUs)
+{
+    return
+        durationUs >= LONG_MIN_US &&
+        durationUs <= LONG_MAX_US;
+}
+
+bool cc1101Connected = false;
+int cc1101Rssi = -999;
+
+
+void IRAM_ATTR handleRfEdge();
+void processRfEdges();
+void finishFrame();
+
+
+WebServer server(80);
+
+struct ReceivedMessage
+{
+    uint32_t sequence;
+    uint64_t timestampMs;
+    uint64_t code;
+    int rssiDbm;
+};
+
+ReceivedMessage messages[MAX_MESSAGES];
+
+size_t messageWriteIndex = 0;
+size_t messageCount = 0;
+uint32_t messageSequence = 0;
 
 bool isTimeSynchronized()
 {
@@ -94,39 +135,24 @@ uint64_t getEpochMilliseconds()
         static_cast<uint64_t>(tv.tv_usec) / 1000ULL;
 }
 
-// -----------------------------------------------------------------------------
-// RF logging
-// -----------------------------------------------------------------------------
-
-void recordRfSignal(bool level, uint32_t durationUs)
+void recordReceivedMessage(uint64_t code, int rssiDbm)
 {
-    RfSignal &signal = signals[signalWriteIndex];
+    ReceivedMessage &message =
+        messages[messageWriteIndex];
 
-    signal.sequence = ++signalSequence;
-    signal.timestampMs = getEpochMilliseconds();
-    signal.level = level;
-    signal.durationUs = durationUs;
+    message.sequence = ++messageSequence;
+    message.timestampMs = getEpochMilliseconds();
+    message.code = code;
+    message.rssiDbm = rssiDbm;
 
-    signalWriteIndex =
-        (signalWriteIndex + 1) % MAX_SIGNALS;
+    messageWriteIndex =
+        (messageWriteIndex + 1) % MAX_MESSAGES;
 
-    if (signalCount < MAX_SIGNALS)
+    if (messageCount < MAX_MESSAGES)
     {
-        signalCount++;
+        messageCount++;
     }
-
-    Serial.printf(
-        "[RF] %s | #%lu | %s | %lu us\n",
-        getFormattedTime().c_str(),
-        static_cast<unsigned long>(signal.sequence),
-        signal.level ? "HIGH" : "LOW ",
-        static_cast<unsigned long>(signal.durationUs)
-    );
 }
-
-// -----------------------------------------------------------------------------
-// Wi-Fi
-// -----------------------------------------------------------------------------
 
 void connectWifi()
 {
@@ -169,10 +195,6 @@ void connectWifi()
     Serial.println(" dBm");
 }
 
-// -----------------------------------------------------------------------------
-// NTP
-// -----------------------------------------------------------------------------
-
 void configureTime()
 {
     Serial.println("Starting NTP synchronization...");
@@ -203,10 +225,6 @@ void configureTime()
     Serial.println(getFormattedTime());
 }
 
-// -----------------------------------------------------------------------------
-// mDNS
-// -----------------------------------------------------------------------------
-
 void configureMdns()
 {
     if (!MDNS.begin(HOSTNAME))
@@ -227,15 +245,11 @@ void configureMdns()
     );
 }
 
-// -----------------------------------------------------------------------------
-// JSON API
-// -----------------------------------------------------------------------------
-
 String buildStatusJson()
 {
     String json;
 
-    json.reserve(12000);
+    json.reserve(8000);
 
     json += "{";
 
@@ -270,53 +284,87 @@ String buildStatusJson()
 
     json += "},";
 
-    json += "\"signals\":[";
+    json += "\"rf\":{";
 
-    for (size_t i = 0; i < signalCount; i++)
+    json += "\"connected\":";
+    json += cc1101Connected ? "true" : "false";
+    json += ",";
+
+    json += "\"frequency_mhz\":";
+    json += String(CC1101_FREQ_MHZ, 3);
+    json += ",";
+
+    json += "\"rssi_dbm\":";
+    json += String(cc1101Rssi);
+    json += ",";
+
+    json += "\"dropped_edges\":";
+    json += String(
+        static_cast<unsigned long>(droppedEdges)
+    );
+
+    json += "},";
+
+    json += "\"messages\":[";
+
+    for (size_t i = 0; i < messageCount; i++)
     {
         size_t index =
-            (signalWriteIndex + MAX_SIGNALS - signalCount + i)
-            % MAX_SIGNALS;
+            (
+                messageWriteIndex +
+                MAX_MESSAGES -
+                messageCount +
+                i
+            ) % MAX_MESSAGES;
 
-        const RfSignal &signal = signals[index];
+        const ReceivedMessage &message =
+            messages[index];
+
+        char codeBuffer[16];
+
+        snprintf(
+            codeBuffer,
+            sizeof(codeBuffer),
+            "0x%010llX",
+            static_cast<unsigned long long>(
+                message.code
+            )
+        );
 
         json += "{";
 
         json += "\"sequence\":";
-        json += String(signal.sequence);
+        json += String(message.sequence);
         json += ",";
 
         json += "\"timestamp_ms\":";
         json += String(
-            static_cast<unsigned long long>(signal.timestampMs)
+            static_cast<unsigned long long>(
+                message.timestampMs
+            )
         );
         json += ",";
 
-        json += "\"level\":";
-        json += signal.level ? "1" : "0";
-        json += ",";
+        json += "\"code\":\"";
+        json += codeBuffer;
+        json += "\",";
 
-        json += "\"duration_us\":";
-        json += String(signal.durationUs);
+        json += "\"rssi_dbm\":";
+        json += String(message.rssiDbm);
 
         json += "}";
 
-        if (i + 1 < signalCount)
+        if (i + 1 < messageCount)
         {
             json += ",";
         }
     }
 
     json += "]";
-
     json += "}";
 
     return json;
 }
-
-// -----------------------------------------------------------------------------
-// Web page
-// -----------------------------------------------------------------------------
 
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -341,7 +389,7 @@ body {
     margin: 20px;
 }
 
-h1 {
+h1, h2 {
     color: #fff;
 }
 
@@ -350,6 +398,13 @@ h1 {
     padding: 15px;
     margin-bottom: 20px;
     border-radius: 6px;
+}
+
+.status-grid {
+    display: grid;
+    grid-template-columns:
+        repeat(auto-fit, minmax(220px, 1fr));
+    gap: 8px 24px;
 }
 
 .good {
@@ -367,7 +422,7 @@ table {
 
 th, td {
     border-bottom: 1px solid #333;
-    padding: 6px;
+    padding: 7px;
     text-align: left;
 }
 
@@ -375,12 +430,9 @@ th {
     color: #aaa;
 }
 
-.high {
-    color: #5f5;
-}
-
-.low {
-    color: #5af;
+.code {
+    color: #7df;
+    font-weight: bold;
 }
 
 </style>
@@ -391,7 +443,7 @@ th {
 
 <h1>433 MHz Signal Monitor</h1>
 
-<div class="panel">
+<div class="panel status-grid">
 
     <div>
         Time:
@@ -408,10 +460,6 @@ th {
         <span id="uptime">---</span>
     </div>
 
-</div>
-
-<div class="panel">
-
     <div>
         SSID:
         <span id="ssid">---</span>
@@ -424,15 +472,37 @@ th {
 
     <div>
         Wi-Fi RSSI:
-        <span id="rssi">---</span>
+        <span id="wifi-rssi">---</span>
         dBm
+    </div>
+
+    <div>
+        CC1101:
+        <span id="rf-connected">---</span>
+    </div>
+
+    <div>
+        RF:
+        <span id="rf-frequency">---</span>
+        MHz
+    </div>
+
+    <div>
+        RF RSSI:
+        <span id="rf-rssi">---</span>
+        dBm
+    </div>
+
+    <div>
+        Dropped edges:
+        <span id="dropped">---</span>
     </div>
 
 </div>
 
 <div class="panel">
 
-<h2>Received RF Pulses</h2>
+<h2>Received Messages</h2>
 
 <table>
 
@@ -440,12 +510,12 @@ th {
 <tr>
     <th>#</th>
     <th>Timestamp</th>
-    <th>Level</th>
-    <th>Duration</th>
+    <th>Message</th>
+    <th>RSSI</th>
 </tr>
 </thead>
 
-<tbody id="signals">
+<tbody id="messages">
 </tbody>
 
 </table>
@@ -468,6 +538,13 @@ function formatUptime(ms)
     seconds %= 60;
 
     return `${days}d ${hours}h ${minutes}m ${seconds}s`;
+}
+
+function formatTimestamp(epochMs)
+{
+    const date = new Date(Number(epochMs));
+
+    return date.toLocaleString();
 }
 
 async function refresh()
@@ -501,40 +578,54 @@ async function refresh()
             .textContent =
                 data.wifi.ip;
 
-        document.getElementById('rssi')
+        document.getElementById('wifi-rssi')
             .textContent =
                 data.wifi.rssi_dbm;
 
+        document.getElementById('rf-connected')
+            .textContent =
+                data.rf.connected
+                ? 'CONNECTED'
+                : 'NOT CONNECTED';
+
+        document.getElementById('rf-frequency')
+            .textContent =
+                data.rf.frequency_mhz;
+
+        document.getElementById('rf-rssi')
+            .textContent =
+                data.rf.rssi_dbm;
+
+        document.getElementById('dropped')
+            .textContent =
+                data.rf.dropped_edges;
+
         const tbody =
-            document.getElementById('signals');
+            document.getElementById('messages');
 
         tbody.innerHTML = '';
 
-        const signals =
-            [...data.signals].reverse();
+        const messages =
+            [...data.messages].reverse();
 
-        for (const signal of signals)
+        for (const message of messages)
         {
             const row =
                 document.createElement('tr');
 
-            const levelText =
-                signal.level
-                ? 'HIGH'
-                : 'LOW';
-
-            const levelClass =
-                signal.level
-                ? 'high'
-                : 'low';
-
             row.innerHTML = `
-                <td>${signal.sequence}</td>
-                <td>${signal.timestamp_ms}</td>
-                <td class="${levelClass}">
-                    ${levelText}
+                <td>${message.sequence}</td>
+                <td>
+                    ${formatTimestamp(
+                        message.timestamp_ms
+                    )}
                 </td>
-                <td>${signal.duration_us} us</td>
+                <td class="code">
+                    ${message.code}
+                </td>
+                <td>
+                    ${message.rssi_dbm} dBm
+                </td>
             `;
 
             tbody.appendChild(row);
@@ -555,10 +646,6 @@ refresh();
 </body>
 </html>
 )rawliteral";
-
-// -----------------------------------------------------------------------------
-// HTTP handlers
-// -----------------------------------------------------------------------------
 
 void handleRoot()
 {
@@ -608,10 +695,6 @@ void configureWebServer()
     Serial.println("HTTP server started.");
 }
 
-// -----------------------------------------------------------------------------
-// Status output
-// -----------------------------------------------------------------------------
-
 void printStatus()
 {
     Serial.println();
@@ -648,15 +731,400 @@ void printStatus()
     Serial.print(HOSTNAME);
     Serial.println(".local");
 
-    Serial.print("RF Pulses:  ");
-    Serial.println(signalCount);
+    Serial.print("CC1101:     ");
+    Serial.println(
+        cc1101Connected
+        ? "CONNECTED"
+        : "NOT CONNECTED"
+    );
+
+    if (cc1101Connected)
+    {
+        cc1101Rssi = ELECHOUSE_cc1101.getRssi();
+
+        Serial.print("RF Freq:    ");
+        Serial.print(CC1101_FREQ_MHZ, 3);
+        Serial.println(" MHz");
+
+        Serial.print("RF RSSI:    ");
+        Serial.print(cc1101Rssi);
+        Serial.println(" dBm");
+
+}
+
+    Serial.print("Messages:   ");
+    Serial.println(messageCount);
+
+    Serial.print("Dropped:    ");
+    Serial.println(droppedEdges);
 
     Serial.println("-------------------------");
 }
 
-// -----------------------------------------------------------------------------
-// Setup
-// -----------------------------------------------------------------------------
+void configureCC1101()
+{
+    Serial.println();
+    Serial.println("----- CC1101 INIT -----");
+
+    ELECHOUSE_cc1101.setSpiPin(
+        CC1101_SCK,
+        CC1101_MISO,
+        CC1101_MOSI,
+        CC1101_CS
+    );
+
+    ELECHOUSE_cc1101.setGDO0(CC1101_GDO0);
+
+    Serial.printf(
+        "SPI: SCK=%d MISO=%d MOSI=%d CS=%d\n",
+        CC1101_SCK,
+        CC1101_MISO,
+        CC1101_MOSI,
+        CC1101_CS
+    );
+
+    Serial.printf(
+        "GDO0: GPIO%d\n",
+        CC1101_GDO0
+    );
+
+    // Initialize chip first.
+    ELECHOUSE_cc1101.Init();
+
+    // Verify communication using hardware status registers.
+    byte partnum =
+        ELECHOUSE_cc1101.SpiReadStatus(CC1101_PARTNUM);
+
+    byte version =
+        ELECHOUSE_cc1101.SpiReadStatus(CC1101_VERSION);
+
+    Serial.printf(
+        "PARTNUM: 0x%02X\n",
+        partnum
+    );
+
+    Serial.printf(
+        "VERSION: 0x%02X\n",
+        version
+    );
+
+    // Valid SPI communication:
+    // PARTNUM normally = 0x00.
+    // VERSION may vary by CC1101 silicon/module.
+    cc1101Connected =
+        (partnum == 0x00) &&
+        (version != 0x00) &&
+        (version != 0xFF);
+
+    if (!cc1101Connected)
+    {
+        Serial.println("CC1101: CONNECTION FAILED");
+        Serial.println("-----------------------");
+        return;
+    }
+
+    Serial.println("CC1101: CONNECTION OK");
+
+    // ASK/OOK
+    ELECHOUSE_cc1101.setModulation(2);
+
+    // Center frequency observed from original remote
+    ELECHOUSE_cc1101.setMHZ(CC1101_FREQ_MHZ);
+
+    // Raw asynchronous serial mode
+    ELECHOUSE_cc1101.setPktFormat(3);
+
+    // RX channel bandwidth
+    ELECHOUSE_cc1101.setRxBW(203.125);
+
+    // Enter RX
+    ELECHOUSE_cc1101.SetRx();
+
+    pinMode(CC1101_GDO0, INPUT);
+
+    lastEdgeMicros = micros();
+
+    attachInterrupt(
+        digitalPinToInterrupt(CC1101_GDO0),
+        handleRfEdge,
+        CHANGE
+    );
+
+    Serial.println("GDO0 edge capture: ENABLED");
+
+    delay(10);
+
+    cc1101Rssi = ELECHOUSE_cc1101.getRssi();
+
+    Serial.printf(
+        "Frequency: %.3f MHz\n",
+        CC1101_FREQ_MHZ
+    );
+
+    Serial.println("Modulation: ASK/OOK");
+    Serial.println("Packet mode: ASYNC RAW");
+
+    Serial.printf(
+        "Initial RF RSSI: %d dBm\n",
+        cc1101Rssi
+    );
+
+    Serial.println("Mode: RX");
+    Serial.println("-----------------------");
+}
+
+void IRAM_ATTR handleRfEdge()
+{
+    uint32_t now = micros();
+
+    uint32_t duration =
+        now - lastEdgeMicros;
+
+    lastEdgeMicros = now;
+
+    bool level =
+        digitalRead(CC1101_GDO0);
+
+    size_t next =
+        (edgeWriteIndex + 1) % EDGE_BUFFER_SIZE;
+
+    // Buffer full: drop this edge.
+    if (next == edgeReadIndex)
+    {
+        droppedEdges++;
+        return;
+    }
+
+    edgeBuffer[edgeWriteIndex].durationUs =
+        duration;
+
+    // The duration that just ended belongs to the
+    // opposite state of the current pin level.
+    edgeBuffer[edgeWriteIndex].level =
+        !level;
+
+    edgeWriteIndex = next;
+}
+
+void processRfEdges()
+{
+    // Sample RSSI for diagnostic information.
+    cc1101Rssi =
+        ELECHOUSE_cc1101.getRssi();
+
+    // Track strongest RSSI seen while collecting this frame.
+    if (cc1101Rssi > frameRssiPeak)
+    {
+        frameRssiPeak = cc1101Rssi;
+    }
+
+    // We can process aggressively now because there is
+    // no Serial printing for individual edges.
+    static constexpr size_t MAX_EDGES_PER_PASS = 128;
+
+    size_t processed = 0;
+
+    while (
+        edgeReadIndex != edgeWriteIndex &&
+        processed < MAX_EDGES_PER_PASS
+    )
+    {
+        RawEdge edge;
+
+        noInterrupts();
+
+        edge.durationUs =
+            edgeBuffer[edgeReadIndex].durationUs;
+
+        edge.level =
+            edgeBuffer[edgeReadIndex].level;
+
+        edgeReadIndex =
+            (edgeReadIndex + 1)
+            % EDGE_BUFFER_SIZE;
+
+        interrupts();
+
+        processed++;
+
+        // Ignore tiny noise/glitch pulses.
+        if (edge.durationUs < SHORT_MIN_US)
+        {
+            continue;
+        }
+
+        // A long LOW is our frame separator.
+        //
+        // The remote has shown roughly a 4.4 ms LOW
+        // between repeated frames, so 3 ms gives us
+        // comfortable separation.
+        if (
+            !edge.level &&
+            edge.durationUs >= FRAME_GAP_US
+        )
+        {
+            if (framePulseCount > 0)
+            {
+                finishFrame();
+            }
+
+            continue;
+        }
+
+        // Only retain pulses that match one of our
+        // two expected timing families.
+        bool validPulse =
+            isShortPulse(edge.durationUs) ||
+            isLongPulse(edge.durationUs);
+
+        if (!validPulse)
+        {
+            continue;
+        }
+
+        // Store valid pulse.
+        if (framePulseCount < MAX_FRAME_PULSES)
+        {
+            framePulses[framePulseCount].level =
+                edge.level;
+
+            framePulses[framePulseCount].durationUs =
+                edge.durationUs;
+
+            framePulseCount++;
+        }
+        else
+        {
+            // Corrupt/oversized frame. Start fresh.
+            framePulseCount = 0;
+            frameRssiPeak = -999;
+        }
+    }
+}
+
+void finishFrame()
+{
+    if (framePulseCount < 4)
+    {
+        framePulseCount = 0;
+        frameRssiPeak = -999;
+        return;
+    }
+
+    uint64_t code = 0;
+    size_t bitCount = 0;
+    size_t invalidCount = 0;
+
+    size_t startIndex = 0;
+
+    // Align decoder to the first HIGH pulse.
+    while (
+        startIndex < framePulseCount &&
+        !framePulses[startIndex].level
+    )
+    {
+        startIndex++;
+    }
+
+    // Decode HIGH/LOW pulse pairs directly into the numeric code.
+    for (
+        size_t i = startIndex;
+        i + 1 < framePulseCount;
+        i += 2
+    )
+    {
+        const FramePulse &high =
+            framePulses[i];
+
+        const FramePulse &low =
+            framePulses[i + 1];
+
+        // Every symbol must be HIGH followed by LOW.
+        if (!high.level || low.level)
+        {
+            invalidCount++;
+            continue;
+        }
+
+        bool bit;
+
+        // 0 = SHORT HIGH + LONG LOW
+        if (
+            isShortPulse(high.durationUs) &&
+            isLongPulse(low.durationUs)
+        )
+        {
+            bit = false;
+        }
+
+        // 1 = LONG HIGH + SHORT LOW
+        else if (
+            isLongPulse(high.durationUs) &&
+            isShortPulse(low.durationUs)
+        )
+        {
+            bit = true;
+        }
+
+        else
+        {
+            invalidCount++;
+            continue;
+        }
+
+        code <<= 1;
+
+        if (bit)
+        {
+            code |= 1ULL;
+        }
+
+        bitCount++;
+    }
+
+    // Save diagnostic values before clearing the frame.
+    const int rssi = frameRssiPeak;
+
+    // Always reset capture state.
+    framePulseCount = 0;
+    frameRssiPeak = -999;
+
+    // Ignore incomplete or corrupt frames.
+    if (
+        bitCount != 40 ||
+        invalidCount != 0
+    )
+    {
+        return;
+    }
+
+    const uint32_t now = millis();
+
+    // A single physical button press sends the same
+    // 40-bit message repeatedly. Print it only once.
+    if (
+        code == lastPrintedRfCode &&
+        (now - lastPrintedRfMs) < RF_DUPLICATE_WINDOW_MS
+    )
+    {
+        return;
+    }
+
+    lastPrintedRfCode = code;
+    lastPrintedRfMs = now;
+
+    recordReceivedMessage(
+        code,
+        rssi
+    );
+
+    Serial.printf(
+        "%s  RX  0x%010llX  RSSI=%d dBm\n",
+        getFormattedTime().c_str(),
+        static_cast<unsigned long long>(code),
+        rssi
+    );
+}
 
 void setup()
 {
@@ -670,6 +1138,9 @@ void setup()
     Serial.println("============================");
     Serial.println();
 
+    configureCC1101();
+
+
     connectWifi();
 
     configureTime();
@@ -679,41 +1150,13 @@ void setup()
     configureWebServer();
 
     printStatus();
-
-    // -------------------------------------------------------------------------
-    // Temporary test data
-    //
-    // DELETE these once the CC1101 is connected.
-    //
-    // These emulate the ~300 / ~900 us pulses we observed from your remote.
-    // -------------------------------------------------------------------------
-
-    recordRfSignal(true, 326);
-    recordRfSignal(false, 851);
-
-    recordRfSignal(true, 918);
-    recordRfSignal(false, 263);
 }
-
-// -----------------------------------------------------------------------------
-// Main loop
-// -----------------------------------------------------------------------------
 
 void loop()
 {
     server.handleClient();
 
-    static uint32_t lastStatusPrint = 0;
-
-    if (
-        millis() - lastStatusPrint
-        >= STATUS_PRINT_INTERVAL_MS
-    )
-    {
-        lastStatusPrint = millis();
-
-        printStatus();
-    }
+    processRfEdges();
 
     // Reconnect Wi-Fi if it drops.
     if (WiFi.status() != WL_CONNECTED)
