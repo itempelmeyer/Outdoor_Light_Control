@@ -1,0 +1,37 @@
+#pragma once
+#include <Arduino.h>
+
+namespace Config
+{
+    // ----- CC1101 / SPI -----
+    constexpr uint8_t CC1101_GDO0 = 36;
+    constexpr uint8_t CC1101_CS   = 17;
+    constexpr uint8_t CC1101_SCK  = 22;
+    constexpr uint8_t CC1101_MOSI = 23;
+    constexpr uint8_t CC1101_MISO = 32;
+
+    constexpr float CC1101_FREQ_MHZ = 433.945f;
+
+    // ----- RF decoder timing -----
+    constexpr uint32_t SHORT_MIN_US = 200;
+    constexpr uint32_t SHORT_MAX_US = 450;
+    constexpr uint32_t LONG_MIN_US  = 700;
+    constexpr uint32_t LONG_MAX_US  = 1050;
+    constexpr uint32_t FRAME_GAP_US = 3000;
+
+    constexpr size_t EDGE_BUFFER_SIZE = 512;
+    constexpr size_t MAX_FRAME_PULSES = 128;
+    constexpr size_t MAX_MESSAGES = 50;
+
+    // Suppress repeated copies transmitted during one button press.
+    constexpr uint32_t RF_DUPLICATE_WINDOW_MS = 300;
+
+    // ----- Network / web -----
+    constexpr char HOSTNAME[] = "local433signals";
+
+    constexpr char TZ_INFO[] =
+        "CST6CDT,M3.2.0/2,M11.1.0/2";
+
+    constexpr char NTP_SERVER_1[] = "pool.ntp.org";
+    constexpr char NTP_SERVER_2[] = "time.nist.gov";
+}
