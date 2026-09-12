@@ -260,7 +260,9 @@ namespace
             );
         }
     }
+
 }
+
 
 namespace RxReceiver
 {
@@ -378,6 +380,13 @@ namespace RxReceiver
             cc1101Rssi
         );
 
+        Serial.printf(
+            "RX duplicate window: %lu ms\n",
+            static_cast<unsigned long>(
+                Config::RF_DUPLICATE_WINDOW_MS
+            )
+        );
+
         Serial.println("Mode: RX");
         Serial.println("-----------------------");
     }
@@ -483,6 +492,56 @@ namespace RxReceiver
                 frameRssiPeak = -999;
             }
         }
+    }
+
+    void pauseCapture()
+        {
+            detachInterrupt(
+                digitalPinToInterrupt(
+                    Config::CC1101_GDO0
+                )
+            );
+
+            // Throw away anything partially received.
+            noInterrupts();
+
+            edgeReadIndex = edgeWriteIndex;
+
+            interrupts();
+
+            framePulseCount = 0;
+            frameRssiPeak = -999;
+        }
+
+    void resumeCapture()
+    {
+        framePulseCount = 0;
+        frameRssiPeak = -999;
+
+        noInterrupts();
+
+        edgeReadIndex = edgeWriteIndex;
+
+        interrupts();
+
+        pinMode(
+            Config::CC1101_GDO0,
+            INPUT
+        );
+
+        delay(2);
+
+        lastEdgeMicros = micros();
+
+        attachInterrupt(
+            digitalPinToInterrupt(
+                Config::CC1101_GDO0
+            ),
+            handleRfEdge,
+            CHANGE
+        );
+
+        Serial.println("RX interrupt attached");
     }
 
     bool isConnected()

@@ -31,4 +31,8 @@ namespace RxReceiver
         size_t index,
         ReceivedMessage &message
     );
+
+    void pauseCapture();
+    void resumeCapture();
 }
+

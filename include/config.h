@@ -4,7 +4,7 @@
 namespace Config
 {
     // ----- CC1101 / SPI -----
-    constexpr uint8_t CC1101_GDO0 = 36;
+    constexpr uint8_t CC1101_GDO0 = 33;
     constexpr uint8_t CC1101_CS   = 17;
     constexpr uint8_t CC1101_SCK  = 22;
     constexpr uint8_t CC1101_MOSI = 23;
@@ -23,8 +23,15 @@ namespace Config
     constexpr size_t MAX_FRAME_PULSES = 128;
     constexpr size_t MAX_MESSAGES = 50;
 
+    // ----- RF transmit timing -----
+    constexpr uint32_t TX_SHORT_US = 300;
+    constexpr uint32_t TX_LONG_US  = 900;
+    constexpr uint32_t TX_GAP_US   = 4400;
+
+    constexpr uint8_t TX_REPEAT_COUNT = 8;
+
     // Suppress repeated copies transmitted during one button press.
-    constexpr uint32_t RF_DUPLICATE_WINDOW_MS = 300;
+    constexpr uint32_t RF_DUPLICATE_WINDOW_MS = 500;
 
     // ----- Network / web -----
     constexpr char HOSTNAME[] = "local433signals";
