@@ -4,12 +4,13 @@
 #include "rx_receiver.h"
 #include "web_page.h"
 #include "secrets.h"
-
+#include "tx_transmitter.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <time.h>
+#include "rf_state.h"
 
 namespace
 {
@@ -233,6 +234,68 @@ namespace
 
         json += "},";
 
+        json += "\"circuits\":{";
+
+        for (
+            uint8_t circuit = 1;
+            circuit <= 3;
+            circuit++
+        )
+        {
+            RfState::CircuitState state =
+                RfState::getState(circuit);
+
+            json += "\"";
+            json += String(circuit);
+            json += "\":{";
+
+            json += "\"known\":";
+            json +=
+                state.known
+                ? "true"
+                : "false";
+            json += ",";
+
+            json += "\"state\":\"";
+
+            if (!state.known)
+            {
+                json += "UNKNOWN";
+            }
+            else if (state.isOn)
+            {
+                json += "ON";
+            }
+            else
+            {
+                json += "OFF";
+            }
+
+            json += "\",";
+
+            json += "\"source\":\"";
+            json +=
+                RfState::sourceToString(
+                    state.source
+                );
+            json += "\",";
+
+            json += "\"last_update_ms\":";
+            json += String(
+                state.lastUpdateMs
+            );
+
+            json += "}";
+
+            if (circuit < 3)
+            {
+                json += ",";
+            }
+        }
+
+        json += "},";
+
+
         json += "\"messages\":[";
 
         const size_t count =
@@ -314,13 +377,86 @@ namespace
             INDEX_HTML
         );
     }
-
+   
     void handleApiStatus()
     {
         server.send(
             200,
             "application/json",
             buildStatusJson()
+        );
+    }
+
+    void handleApiState()
+    {
+        String json;
+        json.reserve(512);
+
+        json += "{";
+
+        for (
+            uint8_t circuit = 1;
+            circuit <= 3;
+            circuit++
+        )
+        {
+            RfState::CircuitState state =
+                RfState::getState(circuit);
+
+            json += "\"";
+            json += String(circuit);
+            json += "\":{";
+
+            json += "\"known\":";
+            json +=
+                state.known
+                ? "true"
+                : "false";
+            json += ",";
+
+            json += "\"state\":\"";
+
+            if (!state.known)
+            {
+                json += "UNKNOWN";
+            }
+            else if (state.isOn)
+            {
+                json += "ON";
+            }
+            else
+            {
+                json += "OFF";
+            }
+
+            json += "\",";
+
+            json += "\"source\":\"";
+            json +=
+                RfState::sourceToString(
+                    state.source
+                );
+            json += "\",";
+
+            json += "\"last_update_ms\":";
+            json += String(
+                state.lastUpdateMs
+            );
+
+            json += "}";
+
+            if (circuit < 3)
+            {
+                json += ",";
+            }
+        }
+
+        json += "}";
+
+        server.send(
+            200,
+            "application/json",
+            json
         );
     }
 
@@ -336,6 +472,88 @@ namespace
             "/api/status",
             HTTP_GET,
             handleApiStatus
+        );
+
+        server.on(
+            "/api/state",
+            HTTP_GET,
+            handleApiState
+        );
+
+        server.on(
+            "/api/tx/c1/on",
+            HTTP_POST,
+            []()
+            {
+                bool success =
+                    TxTransmitter::sendCircuit1On();
+
+                if (success)
+                {
+                    server.send(
+                        200,
+                        "application/json",
+                        "{\"success\":true,\"circuit\":1,\"action\":\"ON\"}"
+                    );
+                }
+                else
+                {
+                    server.send(
+                        500,
+                        "application/json",
+                        "{\"success\":false,\"circuit\":1,\"action\":\"ON\"}"
+                    );
+                }
+            }
+        );
+
+        server.on(
+            "/api/tx/c1/off",
+            HTTP_POST,
+            []()
+            {
+                bool success =
+                    TxTransmitter::sendCircuit1Off();
+
+                if (success)
+                {
+                    server.send(
+                        200,
+                        "application/json",
+                        "{\"success\":true,\"circuit\":1,\"action\":\"OFF\"}"
+                    );
+                }
+                else
+                {
+                    server.send(
+                        500,
+                        "application/json",
+                        "{\"success\":false,\"circuit\":1,\"action\":\"OFF\"}"
+                    );
+                }
+            }
+        );
+
+        server.on(
+            "/api/tx/status",
+            HTTP_GET,
+            []()
+            {
+                String json = "{";
+
+                json += "\"next_counter\":";
+                json += String(
+                    TxTransmitter::getNextCounter()
+                );
+
+                json += "}";
+
+                server.send(
+                    200,
+                    "application/json",
+                    json
+                );
+            }
         );
 
         server.onNotFound(

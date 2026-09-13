@@ -2,7 +2,7 @@
 #include "rx_receiver.h"
 #include "config.h"
 #include "rf_protocol.h"
-
+#include "rf_state.h"
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 
 namespace
@@ -238,6 +238,12 @@ namespace TxTransmitter
         }
 
         returnToRxMode();
+
+        RfState::setState(
+            circuit,
+            action,
+            RfState::Source::Tx
+        );
 
         nextCounter =
             (nextCounter + 1) & 0x0F;

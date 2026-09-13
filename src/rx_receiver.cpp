@@ -4,6 +4,7 @@
 #include <SPI.h>
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 #include <sys/time.h>
+#include "rf_state.h"
 
 namespace
 {
@@ -242,11 +243,21 @@ namespace
 
         if (decoded.valid)
         {
+            RfState::setState(
+                decoded.circuit,
+                decoded.action,
+                RfState::Source::Rx
+            );
+
             Serial.printf(
                 "RX  C%d %-3s  0x%010llX  CNT=%X  RSSI=%d dBm\n",
                 decoded.circuit,
-                RfProtocol::actionToString(decoded.action),
-                static_cast<unsigned long long>(code),
+                RfProtocol::actionToString(
+                    decoded.action
+                ),
+                static_cast<unsigned long long>(
+                    code
+                ),
                 decoded.counter,
                 rssi
             );
@@ -255,7 +266,9 @@ namespace
         {
             Serial.printf(
                 "RX  UNKNOWN  0x%010llX  RSSI=%d dBm\n",
-                static_cast<unsigned long long>(code),
+                static_cast<unsigned long long>(
+                    code
+                ),
                 rssi
             );
         }
