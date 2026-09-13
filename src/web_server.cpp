@@ -12,9 +12,17 @@
 #include <time.h>
 #include "rf_state.h"
 
+
+
 namespace
 {
     WebServer server(80);
+
+    uint32_t lastNtpRetryMs = 0;
+    bool ntpSyncAnnounced = false;
+
+    constexpr uint32_t NTP_RETRY_INTERVAL_MS =
+        60000;
 
     bool isTimeSynchronized()
     {
@@ -111,33 +119,49 @@ namespace
             Config::NTP_SERVER_2
         );
 
-        uint32_t startTime = millis();
+        lastNtpRetryMs = millis();
+    }
 
-        while (!isTimeSynchronized())
+    void processTimeSync()
+    {
+        if (isTimeSynchronized())
         {
-            delay(250);
-            Serial.print(".");
-
-            if (
-                millis() - startTime >
-                15000
-            )
+            if (!ntpSyncAnnounced)
             {
-                Serial.println();
-                Serial.println(
-                    "NTP synchronization timed out."
+                ntpSyncAnnounced = true;
+
+                Serial.print(
+                    "Time synchronized: "
                 );
-                return;
+
+                Serial.println(
+                    getFormattedTime()
+                );
             }
+
+            return;
         }
 
-        Serial.println();
+        uint32_t nowMs = millis();
 
-        Serial.print(
-            "Time synchronized: "
-        );
+        if (
+            nowMs - lastNtpRetryMs <
+            NTP_RETRY_INTERVAL_MS
+        )
+        {
+            return;
+        }
+
+        lastNtpRetryMs = nowMs;
+
         Serial.println(
-            getFormattedTime()
+            "NTP not synchronized. Retrying..."
+        );
+
+        configTzTime(
+            Config::TZ_INFO,
+            Config::NTP_SERVER_1,
+            Config::NTP_SERVER_2
         );
     }
 
@@ -591,6 +615,8 @@ namespace WebServerApp
     {
         server.handleClient();
 
+        processTimeSync();
+
         if (WiFi.status() != WL_CONNECTED)
         {
             Serial.println(
@@ -598,6 +624,9 @@ namespace WebServerApp
             );
 
             connectWifi();
+
+            lastNtpRetryMs = 0;
+            ntpSyncAnnounced = false;
         }
     }
 

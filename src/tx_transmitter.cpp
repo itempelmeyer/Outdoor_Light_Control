@@ -4,6 +4,7 @@
 #include "rf_protocol.h"
 #include "rf_state.h"
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
+#include "mqtt_client.h"
 
 namespace
 {
@@ -243,6 +244,12 @@ namespace TxTransmitter
             circuit,
             action,
             RfState::Source::Tx
+        );
+
+        MqttClient::publishCircuitState(
+            circuit,
+            action ==
+                RfProtocol::Action::On
         );
 
         nextCounter =

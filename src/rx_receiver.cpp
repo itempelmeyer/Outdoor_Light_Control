@@ -5,6 +5,7 @@
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 #include <sys/time.h>
 #include "rf_state.h"
+#include "mqtt_client.h"
 
 namespace
 {
@@ -247,6 +248,12 @@ namespace
                 decoded.circuit,
                 decoded.action,
                 RfState::Source::Rx
+            );
+
+            MqttClient::publishCircuitState(
+                decoded.circuit,
+                decoded.action ==
+                    RfProtocol::Action::On
             );
 
             Serial.printf(

@@ -3,6 +3,7 @@
 #include "rx_receiver.h"
 #include "web_server.h"
 #include "tx_transmitter.h"
+#include "mqtt_client.h"
 
 void handleSerialDiagnostics()
 {
@@ -45,12 +46,14 @@ void setup()
     RxReceiver::begin();
     TxTransmitter::begin();
     WebServerApp::begin();
+    MqttClient::begin();
 }
 
 void loop()
 {
     WebServerApp::process();
     RxReceiver::process();
+    MqttClient::process();
     handleSerialDiagnostics();
 
 }
