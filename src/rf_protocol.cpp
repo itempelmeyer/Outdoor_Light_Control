@@ -2,136 +2,45 @@
 
 namespace RfProtocol
 {
-    static uint16_t getCommandFor(
-        uint8_t circuit,
-        Action action
-    )
-    {
-        if (circuit == 1)
-        {
-            if (action == Action::Off)
-                return 0xA5C9;
-
-            if (action == Action::On)
-                return 0x9ABE;
-        }
-
-        if (circuit == 2)
-        {
-            if (action == Action::Off)
-                return 0xABCF;
-
-            if (action == Action::On)
-                return 0x94B8;
-        }
-
-        if (circuit == 3)
-        {
-            if (action == Action::Off)
-                return 0xA3C7;
-
-            if (action == Action::On)
-                return 0x9CC0;
-        }
-
-        return 0x0000;
-    }
-
-
     DecodedMessage decode(uint64_t code)
     {
-        DecodedMessage decoded{};
+        DecodedMessage result{};
 
-        decoded.valid = false;
-        decoded.circuit = 0;
-        decoded.action = Action::Unknown;
+        result.valid = false;
 
-        // First 16 bits appear to identify this remote/device family.
-        decoded.device =
-            static_cast<uint16_t>(
-                (code >> 24) & 0xFFFF
-            );
-
-        // Middle 16 bits are the command.
-        decoded.command =
+        result.device =
             static_cast<uint16_t>(
                 (code >> 8) & 0xFFFF
             );
 
-        // Final byte contains:
-        // high nibble = complement
-        // low nibble  = counter
-        uint8_t suffix =
-            static_cast<uint8_t>(
+        result.command =
+            static_cast<uint16_t>(
                 code & 0xFF
             );
 
-        decoded.counter =
-            suffix & 0x0F;
+        result.counter = 0;
+        result.checkNibble = 0;
 
-        decoded.checkNibble =
-            (suffix >> 4) & 0x0F;
+        result.circuit = 0;
+        result.action = Action::Unknown;
 
-        bool counterValid =
-            decoded.checkNibble ==
-            ((~decoded.counter) & 0x0F);
-
-        bool deviceValid =
-            decoded.device == 0x1410;
-
-        switch (decoded.command)
+        if (code == CODE_CIRCUIT1_OFF)
         {
-            case 0xA5C9:
-                decoded.circuit = 1;
-                decoded.action = Action::Off;
-                break;
-
-            case 0x9ABE:
-                decoded.circuit = 1;
-                decoded.action = Action::On;
-                break;
-
-            case 0xABCF:
-                decoded.circuit = 2;
-                decoded.action = Action::Off;
-                break;
-
-            case 0x94B8:
-                decoded.circuit = 2;
-                decoded.action = Action::On;
-                break;
-
-            case 0xA3C7:
-                decoded.circuit = 3;
-                decoded.action = Action::Off;
-                break;
-
-            case 0x9CC0:
-                decoded.circuit = 3;
-                decoded.action = Action::On;
-                break;
-
-            default:
-                decoded.circuit = 0;
-                decoded.action = Action::Unknown;
-                break;
+            result.valid = true;
+            result.circuit = 1;
+            result.action = Action::Off;
+        }
+        else if (code == CODE_CIRCUIT1_ON)
+        {
+            result.valid = true;
+            result.circuit = 1;
+            result.action = Action::On;
         }
 
-        bool commandValid =
-            decoded.action != Action::Unknown;
-
-        decoded.valid =
-            deviceValid &&
-            counterValid &&
-            commandValid;
-
-        return decoded;
+        return result;
     }
 
-
-    const char *actionToString(
-        Action action
-    )
+    const char *actionToString(Action action)
     {
         switch (action)
         {
@@ -146,18 +55,11 @@ namespace RfProtocol
         }
     }
 
-
-    uint8_t buildCounterByte(
-        uint8_t counter
-    )
+    uint8_t buildCounterByte(uint8_t counter)
     {
-        counter &= 0x0F;
-
-        return
-            ((~counter & 0x0F) << 4) |
-            counter;
+        // No rolling counter in this protocol.
+        return counter;
     }
-
 
     uint64_t buildFrame(
         uint8_t circuit,
@@ -165,34 +67,23 @@ namespace RfProtocol
         uint8_t counter
     )
     {
-        uint16_t command =
-            getCommandFor(
-                circuit,
-                action
-            );
+        (void)counter;
 
-        if (command == 0x0000)
+        if (circuit != 1)
         {
             return 0;
         }
 
-        uint8_t suffix =
-            buildCounterByte(counter);
+        switch (action)
+        {
+            case Action::On:
+                return CODE_CIRCUIT1_ON;
 
-        uint64_t frame = 0;
+            case Action::Off:
+                return CODE_CIRCUIT1_OFF;
 
-        frame |=
-            static_cast<uint64_t>(
-                0x1410
-            ) << 24;
-
-        frame |=
-            static_cast<uint64_t>(
-                command
-            ) << 8;
-
-        frame |= suffix;
-
-        return frame;
+            default:
+                return 0;
+        }
     }
 }

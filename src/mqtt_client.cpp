@@ -16,16 +16,16 @@ namespace
     uint32_t lastReconnectAttemptMs = 0;
 
     constexpr char MQTT_CLIENT_ID[] =
-        "rfhouse-esp32";
+        "outdoor-light-control";
 
     constexpr char TOPIC_STATUS[] =
-        "rfhouse/status";
+        "outdoor-light-control/status";
 
     constexpr char TOPIC_C1_SET[] =
-        "rfhouse/circuit1/set";
+        "outdoor-light-control/circuit1/set";
 
     constexpr char TOPIC_C1_STATE[] =
-        "rfhouse/circuit1/state";
+        "outdoor-light-control/circuit1/state";
 
 
     void publishCurrentState()

@@ -7,14 +7,9 @@ namespace TxTransmitter
 {
     void begin();
 
-    bool send(
-        uint8_t circuit,
-        RfProtocol::Action action
-    );
-
     bool sendCircuit1On();
     bool sendCircuit1Off();
 
+    // Compatibility only; not part of the RF protocol.
     uint8_t getNextCounter();
-    void setNextCounter(uint8_t counter);
 }

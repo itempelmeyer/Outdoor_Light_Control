@@ -1,11 +1,14 @@
 #include "rx_receiver.h"
+
 #include "config.h"
 #include "rf_protocol.h"
+#include "rf_state.h"
+#include "mqtt_client.h"
+
+#include <Arduino.h>
 #include <SPI.h>
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 #include <sys/time.h>
-#include "rf_state.h"
-#include "mqtt_client.h"
 
 namespace
 {
@@ -21,26 +24,38 @@ namespace
         uint32_t durationUs;
     };
 
-    volatile RawEdge edgeBuffer[Config::EDGE_BUFFER_SIZE];
+    volatile RawEdge
+        edgeBuffer[Config::EDGE_BUFFER_SIZE];
+
     volatile size_t edgeWriteIndex = 0;
     volatile size_t edgeReadIndex = 0;
+
     volatile uint32_t lastEdgeMicros = 0;
     volatile uint32_t droppedEdges = 0;
 
-    FramePulse framePulses[Config::MAX_FRAME_PULSES];
+    FramePulse
+        framePulses[Config::MAX_FRAME_PULSES];
+
     size_t framePulseCount = 0;
+
     int frameRssiPeak = -999;
 
     bool cc1101Connected = false;
     int cc1101Rssi = -999;
 
-    RxReceiver::ReceivedMessage messages[Config::MAX_MESSAGES];
+    RxReceiver::ReceivedMessage
+        messages[Config::MAX_MESSAGES];
+
     size_t messageWriteIndex = 0;
     size_t messageCount = 0;
     uint32_t messageSequence = 0;
 
-    uint64_t lastPrintedRfCode = 0;
-    uint32_t lastPrintedRfMs = 0;
+    uint64_t lastAcceptedRfCode = 0;
+    uint32_t lastAcceptedRfMs = 0;
+
+    // -------------------------------------------------------------------------
+    // Pulse helpers
+    // -------------------------------------------------------------------------
 
     bool isShortPulse(uint32_t durationUs)
     {
@@ -56,105 +71,198 @@ namespace
             durationUs <= Config::LONG_MAX_US;
     }
 
+    // -------------------------------------------------------------------------
+    // Time
+    // -------------------------------------------------------------------------
+
     uint64_t getEpochMilliseconds()
     {
         struct timeval tv;
-        gettimeofday(&tv, nullptr);
+
+        gettimeofday(
+            &tv,
+            nullptr
+        );
 
         return
-            static_cast<uint64_t>(tv.tv_sec) * 1000ULL +
-            static_cast<uint64_t>(tv.tv_usec) / 1000ULL;
+            static_cast<uint64_t>(tv.tv_sec) *
+                1000ULL +
+            static_cast<uint64_t>(tv.tv_usec) /
+                1000ULL;
     }
+
+    // -------------------------------------------------------------------------
+    // Message history
+    // -------------------------------------------------------------------------
+
     void recordReceivedMessage(
         uint64_t code,
         int rssiDbm
     )
     {
-        RfProtocol::DecodedMessage decoded =
+        const RfProtocol::DecodedMessage decoded =
             RfProtocol::decode(code);
 
         RxReceiver::ReceivedMessage &message =
             messages[messageWriteIndex];
 
-        message.sequence = ++messageSequence;
-        message.timestampMs = getEpochMilliseconds();
-        message.code = code;
-        message.rssiDbm = rssiDbm;
+        message.sequence =
+            ++messageSequence;
 
-        message.circuit = decoded.circuit;
-        message.action = decoded.action;
-        message.counter = decoded.counter;
-        message.protocolValid = decoded.valid;
+        message.timestampMs =
+            getEpochMilliseconds();
+
+        message.code =
+            code;
+
+        message.rssiDbm =
+            rssiDbm;
+
+        message.circuit =
+            decoded.circuit;
+
+        message.action =
+            decoded.action;
+
+        // Retained for compatibility with web UI.
+        message.counter =
+            decoded.counter;
+
+        message.protocolValid =
+            decoded.valid;
 
         messageWriteIndex =
             (messageWriteIndex + 1) %
             Config::MAX_MESSAGES;
 
-        if (messageCount < Config::MAX_MESSAGES)
+        if (
+            messageCount <
+            Config::MAX_MESSAGES
+        )
         {
             messageCount++;
         }
     }
 
-    void ICACHE_RAM_ATTR handleRfEdge()
-    {
-        uint32_t now = micros();
+    // -------------------------------------------------------------------------
+    // ISR
+    // -------------------------------------------------------------------------
 
-        uint32_t duration =
+    void IRAM_ATTR handleRfEdge()
+    {
+        const uint32_t now =
+            micros();
+
+        const uint32_t duration =
             now - lastEdgeMicros;
 
-        lastEdgeMicros = now;
+        lastEdgeMicros =
+            now;
 
-        bool level =
-            digitalRead(Config::CC1101_GDO0);
+        const bool newLevel =
+            digitalRead(
+                Config::CC1101_GDO0
+            );
 
-        size_t next =
+        const size_t next =
             (edgeWriteIndex + 1) %
             Config::EDGE_BUFFER_SIZE;
 
-        if (next == edgeReadIndex)
+        if (
+            next ==
+            edgeReadIndex
+        )
         {
             droppedEdges++;
             return;
         }
 
-        edgeBuffer[edgeWriteIndex].durationUs =
+        edgeBuffer[
+            edgeWriteIndex
+        ].durationUs =
             duration;
 
-        // Duration belongs to the level that just ended.
-        edgeBuffer[edgeWriteIndex].level =
-            !level;
+        // Duration belongs to the signal level
+        // which just ended.
+        edgeBuffer[
+            edgeWriteIndex
+        ].level =
+            !newLevel;
 
-        edgeWriteIndex = next;
+        edgeWriteIndex =
+            next;
     }
+
+    // -------------------------------------------------------------------------
+    // Frame reset
+    // -------------------------------------------------------------------------
+
+    void clearFrame()
+    {
+        framePulseCount = 0;
+        frameRssiPeak = -999;
+    }
+
+    // -------------------------------------------------------------------------
+    // Decode completed Princeton frame
+    // -------------------------------------------------------------------------
 
     void finishFrame()
     {
-        if (framePulseCount < 4)
+        // Princeton frame consists of:
+        //
+        // 48 data pulses
+        // = 24 HIGH/LOW pairs
+        //
+        // plus normally one trailing SHORT HIGH.
+        //
+        // Captures therefore normally show 49 pulses.
+
+        if (
+            framePulseCount < 48
+        )
         {
-            framePulseCount = 0;
-            frameRssiPeak = -999;
+            clearFrame();
             return;
         }
 
-        uint64_t code = 0;
-        size_t bitCount = 0;
-        size_t invalidCount = 0;
+        const int rssi =
+            frameRssiPeak;
+
+        // Ignore weak ambient RF.
+        if (
+            rssi <
+            Config::RF_RSSI_THRESHOLD_DBM
+        )
+        {
+            clearFrame();
+            return;
+        }
 
         size_t startIndex = 0;
 
-        // Align to the first HIGH pulse.
+        // Align to first HIGH.
         while (
-            startIndex < framePulseCount &&
-            !framePulses[startIndex].level
+            startIndex <
+                framePulseCount &&
+            !framePulses[
+                startIndex
+            ].level
         )
         {
             startIndex++;
         }
 
+        uint64_t code = 0;
+
+        size_t bitCount = 0;
+        size_t invalidCount = 0;
+
+        // Decode only the first 24 valid HIGH/LOW pairs.
         for (
             size_t i = startIndex;
-            i + 1 < framePulseCount;
+            i + 1 < framePulseCount &&
+            bitCount < 24;
             i += 2
         )
         {
@@ -164,26 +272,44 @@ namespace
             const FramePulse &low =
                 framePulses[i + 1];
 
-            if (!high.level || low.level)
+            if (
+                !high.level ||
+                low.level
+            )
             {
                 invalidCount++;
                 continue;
             }
 
-            bool bit;
+            bool bit = false;
 
-            // 0 = SHORT HIGH + LONG LOW
+            // Princeton 0:
+            //
+            // HIGH short
+            // LOW  long
             if (
-                isShortPulse(high.durationUs) &&
-                isLongPulse(low.durationUs)
+                isShortPulse(
+                    high.durationUs
+                ) &&
+                isLongPulse(
+                    low.durationUs
+                )
             )
             {
                 bit = false;
             }
-            // 1 = LONG HIGH + SHORT LOW
+
+            // Princeton 1:
+            //
+            // HIGH long
+            // LOW  short
             else if (
-                isLongPulse(high.durationUs) &&
-                isShortPulse(low.durationUs)
+                isLongPulse(
+                    high.durationUs
+                ) &&
+                isShortPulse(
+                    low.durationUs
+                )
             )
             {
                 bit = true;
@@ -204,92 +330,97 @@ namespace
             bitCount++;
         }
 
-        const int rssi = frameRssiPeak;
+        clearFrame();
 
-        framePulseCount = 0;
-        frameRssiPeak = -999;
-
-        // Only accept clean 40-bit frames.
+        // Require exact clean 24-bit packet.
         if (
-            bitCount != 40 ||
+            bitCount != 24 ||
             invalidCount != 0
         )
         {
             return;
         }
 
-        const uint32_t now = millis();
+        const uint32_t now =
+            millis();
 
-        // Remote repeats the same message several times
-        // during one physical button press.
+        // Physical remote repeats each packet multiple
+        // times while a button is pressed.
         if (
-            code == lastPrintedRfCode &&
-            (now - lastPrintedRfMs) <
-                Config::RF_DUPLICATE_WINDOW_MS
+            code ==
+                lastAcceptedRfCode &&
+            (
+                now -
+                lastAcceptedRfMs
+            ) <
+                Config::
+                    RF_DUPLICATE_WINDOW_MS
         )
         {
             return;
         }
 
-        lastPrintedRfCode = code;
-        lastPrintedRfMs = now;
+        lastAcceptedRfCode =
+            code;
 
-        RfProtocol::DecodedMessage decoded =
-    RfProtocol::decode(code);
+        lastAcceptedRfMs =
+            now;
+
+        const RfProtocol::DecodedMessage decoded =
+            RfProtocol::decode(code);
 
         recordReceivedMessage(
             code,
             rssi
         );
 
-        if (decoded.valid)
-        {
-            RfState::setState(
-                decoded.circuit,
-                decoded.action,
-                RfState::Source::Rx
-            );
-
-            MqttClient::publishCircuitState(
-                decoded.circuit,
-                decoded.action ==
-                    RfProtocol::Action::On
-            );
-
-            Serial.printf(
-                "RX  C%d %-3s  0x%010llX  CNT=%X  RSSI=%d dBm\n",
-                decoded.circuit,
-                RfProtocol::actionToString(
-                    decoded.action
-                ),
-                static_cast<unsigned long long>(
-                    code
-                ),
-                decoded.counter,
-                rssi
-            );
-        }
-        else
+        if (!decoded.valid)
         {
             Serial.printf(
-                "RX  UNKNOWN  0x%010llX  RSSI=%d dBm\n",
+                "RX  UNKNOWN  0x%06llX  RSSI=%d dBm\n",
                 static_cast<unsigned long long>(
                     code
                 ),
                 rssi
             );
+
+            return;
         }
+
+        RfState::setState(
+            decoded.circuit,
+            decoded.action,
+            RfState::Source::Rx
+        );
+
+        MqttClient::publishCircuitState(
+            decoded.circuit,
+            decoded.action ==
+                RfProtocol::Action::On
+        );
+
+        Serial.printf(
+            "RX  C%d %-3s  0x%06llX  RSSI=%d dBm\n",
+            decoded.circuit,
+            RfProtocol::actionToString(
+                decoded.action
+            ),
+            static_cast<unsigned long long>(
+                code
+            ),
+            rssi
+        );
     }
-
 }
-
 
 namespace RxReceiver
 {
     void begin()
     {
         Serial.println();
-        Serial.println("----- CC1101 INIT -----");
+        Serial.println(
+            "----- CC1101 INIT -----"
+        );
 
         ELECHOUSE_cc1101.setSpiPin(
             Config::CC1101_SCK,
@@ -317,12 +448,12 @@ namespace RxReceiver
 
         ELECHOUSE_cc1101.Init();
 
-        byte partnum =
+        const byte partnum =
             ELECHOUSE_cc1101.SpiReadStatus(
                 CC1101_PARTNUM
             );
 
-        byte version =
+        const byte version =
             ELECHOUSE_cc1101.SpiReadStatus(
                 CC1101_VERSION
             );
@@ -338,16 +469,20 @@ namespace RxReceiver
         );
 
         cc1101Connected =
-            (partnum == 0x00) &&
-            (version != 0x00) &&
-            (version != 0xFF);
+            partnum == 0x00 &&
+            version != 0x00 &&
+            version != 0xFF;
 
         if (!cc1101Connected)
         {
             Serial.println(
                 "CC1101: CONNECTION FAILED"
             );
-            Serial.println("-----------------------");
+
+            Serial.println(
+                "-----------------------"
+            );
+
             return;
         }
 
@@ -355,12 +490,20 @@ namespace RxReceiver
             "CC1101: CONNECTION OK"
         );
 
+        // ASK/OOK
         ELECHOUSE_cc1101.setModulation(2);
+
         ELECHOUSE_cc1101.setMHZ(
             Config::CC1101_FREQ_MHZ
         );
+
+        // Asynchronous raw serial mode.
         ELECHOUSE_cc1101.setPktFormat(3);
-        ELECHOUSE_cc1101.setRxBW(203.125);
+
+        ELECHOUSE_cc1101.setRxBW(
+            203.125
+        );
+
         ELECHOUSE_cc1101.SetRx();
 
         pinMode(
@@ -368,7 +511,8 @@ namespace RxReceiver
             INPUT
         );
 
-        lastEdgeMicros = micros();
+        lastEdgeMicros =
+            micros();
 
         attachInterrupt(
             digitalPinToInterrupt(
@@ -391,6 +535,11 @@ namespace RxReceiver
         Serial.println(
             "Modulation: ASK/OOK"
         );
+
+        Serial.println(
+            "Protocol: Princeton 24-bit"
+        );
+
         Serial.println(
             "Packet mode: ASYNC RAW"
         );
@@ -401,14 +550,33 @@ namespace RxReceiver
         );
 
         Serial.printf(
+            "RSSI threshold: %d dBm\n",
+            Config::RF_RSSI_THRESHOLD_DBM
+        );
+
+        Serial.printf(
             "RX duplicate window: %lu ms\n",
             static_cast<unsigned long>(
-                Config::RF_DUPLICATE_WINDOW_MS
+                Config::
+                    RF_DUPLICATE_WINDOW_MS
             )
         );
 
-        Serial.println("Mode: RX");
-        Serial.println("-----------------------");
+        Serial.println(
+            "Expected OFF: 0x256724"
+        );
+
+        Serial.println(
+            "Expected ON:  0x256728"
+        );
+
+        Serial.println(
+            "Mode: RX"
+        );
+
+        Serial.println(
+            "-----------------------"
+        );
     }
 
     void process()
@@ -418,22 +586,16 @@ namespace RxReceiver
             return;
         }
 
-        cc1101Rssi =
-            ELECHOUSE_cc1101.getRssi();
-
-        if (cc1101Rssi > frameRssiPeak)
-        {
-            frameRssiPeak = cc1101Rssi;
-        }
-
         static constexpr size_t
             MAX_EDGES_PER_PASS = 128;
 
         size_t processed = 0;
 
         while (
-            edgeReadIndex != edgeWriteIndex &&
-            processed < MAX_EDGES_PER_PASS
+            edgeReadIndex !=
+                edgeWriteIndex &&
+            processed <
+                MAX_EDGES_PER_PASS
         )
         {
             RawEdge edge;
@@ -451,29 +613,56 @@ namespace RxReceiver
                 ].level;
 
             edgeReadIndex =
-                (edgeReadIndex + 1) %
+                (
+                    edgeReadIndex +
+                    1
+                ) %
                 Config::EDGE_BUFFER_SIZE;
 
             interrupts();
 
             processed++;
 
+            // Refresh RSSI periodically during packet.
+            if (
+                (processed & 0x07) ==
+                1
+            )
+            {
+                cc1101Rssi =
+                    ELECHOUSE_cc1101
+                        .getRssi();
+
+                if (
+                    cc1101Rssi >
+                    frameRssiPeak
+                )
+                {
+                    frameRssiPeak =
+                        cc1101Rssi;
+                }
+            }
+
+            // Ignore very small glitches.
             if (
                 edge.durationUs <
-                Config::SHORT_MIN_US
+                100
             )
             {
                 continue;
             }
 
-            // Long LOW = frame separator.
+            // Long LOW marks end of packet.
             if (
                 !edge.level &&
                 edge.durationUs >=
                     Config::FRAME_GAP_US
             )
             {
-                if (framePulseCount > 0)
+                if (
+                    framePulseCount >
+                    0
+                )
                 {
                     finishFrame();
                 }
@@ -482,8 +671,12 @@ namespace RxReceiver
             }
 
             const bool validPulse =
-                isShortPulse(edge.durationUs) ||
-                isLongPulse(edge.durationUs);
+                isShortPulse(
+                    edge.durationUs
+                ) ||
+                isLongPulse(
+                    edge.durationUs
+                );
 
             if (!validPulse)
             {
@@ -492,12 +685,14 @@ namespace RxReceiver
 
             if (
                 framePulseCount <
-                Config::MAX_FRAME_PULSES
+                Config::
+                    MAX_FRAME_PULSES
             )
             {
                 framePulses[
                     framePulseCount
-                ].level = edge.level;
+                ].level =
+                    edge.level;
 
                 framePulses[
                     framePulseCount
@@ -508,39 +703,37 @@ namespace RxReceiver
             }
             else
             {
-                framePulseCount = 0;
-                frameRssiPeak = -999;
+                clearFrame();
             }
         }
     }
 
     void pauseCapture()
-        {
-            detachInterrupt(
-                digitalPinToInterrupt(
-                    Config::CC1101_GDO0
-                )
-            );
-
-            // Throw away anything partially received.
-            noInterrupts();
-
-            edgeReadIndex = edgeWriteIndex;
-
-            interrupts();
-
-            framePulseCount = 0;
-            frameRssiPeak = -999;
-        }
-
-    void resumeCapture()
     {
-        framePulseCount = 0;
-        frameRssiPeak = -999;
+        detachInterrupt(
+            digitalPinToInterrupt(
+                Config::CC1101_GDO0
+            )
+        );
 
         noInterrupts();
 
-        edgeReadIndex = edgeWriteIndex;
+        edgeReadIndex =
+            edgeWriteIndex;
+
+        interrupts();
+
+        clearFrame();
+    }
+
+    void resumeCapture()
+    {
+        clearFrame();
+
+        noInterrupts();
+
+        edgeReadIndex =
+            edgeWriteIndex;
 
         interrupts();
 
@@ -551,7 +744,8 @@ namespace RxReceiver
 
         delay(2);
 
-        lastEdgeMicros = micros();
+        lastEdgeMicros =
+            micros();
 
         attachInterrupt(
             digitalPinToInterrupt(
@@ -561,7 +755,9 @@ namespace RxReceiver
             CHANGE
         );
 
-        Serial.println("RX interrupt attached");
+        Serial.println(
+            "RX interrupt attached"
+        );
     }
 
     bool isConnected()
@@ -589,20 +785,25 @@ namespace RxReceiver
         ReceivedMessage &message
     )
     {
-        if (index >= messageCount)
+        if (
+            index >=
+            messageCount
+        )
         {
             return false;
         }
 
-        size_t bufferIndex =
+        const size_t bufferIndex =
             (
                 messageWriteIndex +
                 Config::MAX_MESSAGES -
                 messageCount +
                 index
-            ) % Config::MAX_MESSAGES;
+            ) %
+            Config::MAX_MESSAGES;
 
-        message = messages[bufferIndex];
+        message =
+            messages[bufferIndex];
 
         return true;
     }
