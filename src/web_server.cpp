@@ -6,9 +6,9 @@
 #include "secrets.h"
 #include "tx_transmitter.h"
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
 #include <time.h>
 #include "rf_state.h"
 
@@ -16,7 +16,7 @@
 
 namespace
 {
-    WebServer server(80);
+    ESP8266WebServer server(80);
 
     uint32_t lastNtpRetryMs = 0;
     bool ntpSyncAnnounced = false;

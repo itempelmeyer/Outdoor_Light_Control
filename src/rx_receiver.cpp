@@ -96,7 +96,7 @@ namespace
         }
     }
 
-    void IRAM_ATTR handleRfEdge()
+    void ICACHE_RAM_ATTR handleRfEdge()
     {
         uint32_t now = micros();
 
